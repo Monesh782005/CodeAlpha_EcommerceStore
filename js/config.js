@@ -35,8 +35,15 @@
       }
     }
 
-    // 4. Fallback default for local multi-server development
-    return 'http://localhost:5000/api';
+    // 4. Use localhost for local development and Render in production
+    if (
+      window.location.hostname === 'localhost' ||
+      window.location.hostname === '127.0.0.1'
+    ) {
+      return 'http://localhost:5000/api';
+    }
+
+    return 'https://codealpha-ecommercestore-r299.onrender.com/api';
   };
 
   const API_BASE = getApiBaseUrl();
