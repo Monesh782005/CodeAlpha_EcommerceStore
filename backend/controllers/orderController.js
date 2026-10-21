@@ -246,8 +246,8 @@ const verifyOrderAccess = (order, req) => {
         return !!(req.user && String(order.user) === String(req.user._id));
     }
     // If guest order, verify guest token passed via header or query
-    const tokenFromHeader = req.headers["x-guest-token"];
-    const tokenFromQuery = req.query.guestToken;
+    const tokenFromHeader = req.headers?.["x-guest-token"];
+    const tokenFromQuery = req.query?.guestToken;
     const tokenFromBody = req.body?.guestToken;
     const providedToken = tokenFromHeader || tokenFromQuery || tokenFromBody;
 
@@ -388,8 +388,115 @@ const createRazorpayOrder = async (req, res) => {
 };
 
 /**
+ * Helper to fetch a payment entity directly from Razorpay's API.
+ */
+const fetchRazorpayPayment = async (paymentId, keyId, keySecret) => {
+    return new Promise((resolve, reject) => {
+        const https = require("https");
+        const authHeader = "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+        const req = https.request(
+            {
+                hostname: "api.razorpay.com",
+                port: 443,
+                path: `/v1/payments/${encodeURIComponent(paymentId)}`,
+                method: "GET",
+                headers: {
+                    Authorization: authHeader,
+                    "Content-Type": "application/json"
+                },
+                timeout: 10000
+            },
+            (res) => {
+                let data = "";
+                res.on("data", chunk => { data += chunk; });
+                res.on("end", () => {
+                    try {
+                        const parsed = JSON.parse(data);
+                        if (res.statusCode >= 200 && res.statusCode < 300) {
+                            resolve(parsed);
+                        } else {
+                            const errDesc = parsed.error?.description || `Razorpay API returned status ${res.statusCode}`;
+                            reject(new Error(errDesc));
+                        }
+                    } catch (e) {
+                        reject(new Error("Failed to parse response from Razorpay API."));
+                    }
+                });
+            }
+        );
+        req.on("timeout", () => {
+            req.destroy(new Error("Razorpay API request timed out."));
+        });
+        req.on("error", (err) => {
+            reject(new Error(`Razorpay API network error: ${err.message}`));
+        });
+        req.end();
+    });
+};
+
+/**
+ * Helper to capture an authorized Razorpay payment.
+ */
+const captureRazorpayPayment = async (paymentId, amountInPaise, currency, keyId, keySecret) => {
+    return new Promise((resolve, reject) => {
+        const https = require("https");
+        const authHeader = "Basic " + Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+        const postData = JSON.stringify({
+            amount: amountInPaise,
+            currency: currency || "INR"
+        });
+        const req = https.request(
+            {
+                hostname: "api.razorpay.com",
+                port: 443,
+                path: `/v1/payments/${encodeURIComponent(paymentId)}/capture`,
+                method: "POST",
+                headers: {
+                    Authorization: authHeader,
+                    "Content-Type": "application/json",
+                    "Content-Length": Buffer.byteLength(postData)
+                },
+                timeout: 10000
+            },
+            (res) => {
+                let data = "";
+                res.on("data", chunk => { data += chunk; });
+                res.on("end", () => {
+                    try {
+                        const parsed = JSON.parse(data);
+                        if (res.statusCode >= 200 && res.statusCode < 300) {
+                            resolve(parsed);
+                        } else {
+                            const errDesc = parsed.error?.description || `Razorpay capture returned status ${res.statusCode}`;
+                            reject(new Error(errDesc));
+                        }
+                    } catch (e) {
+                        reject(new Error("Failed to parse capture response from Razorpay API."));
+                    }
+                });
+            }
+        );
+        req.on("timeout", () => {
+            req.destroy(new Error("Razorpay capture request timed out."));
+        });
+        req.on("error", (err) => {
+            reject(new Error(`Razorpay capture network error: ${err.message}`));
+        });
+        req.write(postData);
+        req.end();
+    });
+};
+
+const razorpayService = {
+    fetchPayment: fetchRazorpayPayment,
+    capturePayment: captureRazorpayPayment
+};
+
+/**
  * POST /api/orders/:orderId/verify-payment
- * Cryptographically verifies Razorpay payment signature using HMAC SHA256 with RAZORPAY_KEY_SECRET.
+ * Cryptographically verifies Razorpay payment signature using HMAC SHA256 with RAZORPAY_KEY_SECRET,
+ * fetches and validates the payment entity from Razorpay's official API (order_id, amount, currency, status),
+ * captures authorized payments safely, and updates the order status atomically.
  * Idempotent: Prevents double verification or double inventory adjustment.
  */
 const verifyRazorpayPayment = async (req, res) => {
@@ -433,13 +540,13 @@ const verifyRazorpayPayment = async (req, res) => {
         if (clientStatus === "failed" || (!razorpay_payment_id && !razorpay_signature)) {
             return res.status(400).json({
                 success: false,
-                message: req.body.error_description || "Payment was cancelled or dismissed."
+                message: req.body?.error_description || "Payment was cancelled or dismissed."
             });
         }
 
         // 3. Confirm payment parameters match expected order
         const expectedRzpOrderId = order.paymentDetails?.razorpayOrderId;
-        if (expectedRzpOrderId && razorpay_order_id !== expectedRzpOrderId) {
+        if (!expectedRzpOrderId || razorpay_order_id !== expectedRzpOrderId) {
             return res.status(400).json({
                 success: false,
                 message: "Razorpay order ID mismatch. Transaction rejected."
@@ -447,13 +554,20 @@ const verifyRazorpayPayment = async (req, res) => {
         }
 
         // 4. Cryptographic Signature Verification
+        const keyId = process.env.RAZORPAY_KEY_ID || "rzp_test_placeholder_key";
         const keySecret = process.env.RAZORPAY_KEY_SECRET || "rzp_test_placeholder_secret";
-        const generatedSignature = crypto
+        const expectedSignature = crypto
             .createHmac("sha256", keySecret)
             .update(`${razorpay_order_id}|${razorpay_payment_id}`)
             .digest("hex");
 
-        if (generatedSignature !== razorpay_signature) {
+        const signatureBuffer = Buffer.from(razorpay_signature || "", "utf8");
+        const expectedBuffer = Buffer.from(expectedSignature, "utf8");
+
+        const isValidSignature = signatureBuffer.length === expectedBuffer.length &&
+            crypto.timingSafeEqual(signatureBuffer, expectedBuffer);
+
+        if (!isValidSignature) {
             // Security hardening: Reject invalid signatures WITHOUT altering the order to 'failed'.
             // This prevents an attacker from corrupting a valid pending order using invalid probes.
             return res.status(400).json({
@@ -462,7 +576,80 @@ const verifyRazorpayPayment = async (req, res) => {
             });
         }
 
-        // 5. Successful Signature Verification: Mark Order as Paid atomically
+        // 5. Retrieve payment entity from Razorpay official server API
+        let paymentEntity;
+        try {
+            paymentEntity = await razorpayService.fetchPayment(razorpay_payment_id, keyId, keySecret);
+        } catch (apiErr) {
+            console.error("Payment verification failed during gateway fetch:", apiErr.message);
+            return res.status(502).json({
+                success: false,
+                message: "Payment verification failed: Unable to verify transaction with payment gateway."
+            });
+        }
+
+        if (!paymentEntity || typeof paymentEntity !== "object") {
+            return res.status(502).json({
+                success: false,
+                message: "Payment verification failed: Invalid response from payment gateway."
+            });
+        }
+
+        // 6. Validate payment entity against stored MongoDB order
+        // a. Validate order_id
+        if (paymentEntity.order_id !== expectedRzpOrderId) {
+            return res.status(400).json({
+                success: false,
+                message: "Payment entity order ID does not match the order."
+            });
+        }
+
+        // b. Validate currency is exactly INR
+        if (paymentEntity.currency !== "INR") {
+            return res.status(400).json({
+                success: false,
+                message: "Payment currency mismatch. Expected INR."
+            });
+        }
+
+        // c. Validate amount in paise (1 INR = 100 paise)
+        const expectedAmountInPaise = Math.round(order.totalAmount * 100);
+        if (Number(paymentEntity.amount) !== expectedAmountInPaise) {
+            return res.status(400).json({
+                success: false,
+                message: "Payment amount mismatch. Transaction rejected."
+            });
+        }
+
+        // 7. Validate payment status & handle authorized vs captured
+        let currentStatus = paymentEntity.status;
+        if (currentStatus === "authorized") {
+            try {
+                const captureResult = await razorpayService.capturePayment(
+                    razorpay_payment_id,
+                    expectedAmountInPaise,
+                    "INR",
+                    keyId,
+                    keySecret
+                );
+                currentStatus = captureResult?.status;
+            } catch (captureErr) {
+                console.error("Payment verification failed during capture attempt:", captureErr.message);
+                return res.status(400).json({
+                    success: false,
+                    message: "Payment is authorized but could not be captured. Order remains pending."
+                });
+            }
+        }
+
+        if (currentStatus !== "captured") {
+            return res.status(400).json({
+                success: false,
+                message: `Payment status is '${currentStatus}'. Only captured payments can be marked as paid.`
+            });
+        }
+
+        // 8. Successful Signature & Gateway Verification: Mark Order as Paid atomically
         const updatedOrder = await Order.findOneAndUpdate(
             { orderId, paymentStatus: { $ne: "paid" } },
             {
@@ -508,6 +695,7 @@ const verifyRazorpayPayment = async (req, res) => {
             }
         });
     } catch (error) {
+        console.error("Unhandled error during payment verification:", error.message);
         return res.status(500).json({
             success: false,
             message: "Internal error during payment verification."
@@ -643,5 +831,6 @@ module.exports = {
     verifyRazorpayPayment,
     getMyOrders,
     getMyOrderDetails,
-    getOrderById
+    getOrderById,
+    razorpayService
 };
